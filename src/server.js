@@ -300,6 +300,7 @@ app.get('/api/ticketmaster-events', async (req, res) => {
     const { data: rawEvents } = await supabase
       .from('events')
       .select('id, venue_id, event_name, event_date, onsale_start, public_visibility_start, first_seen_at, source_url, created_at, ticketmaster_id')
+      .not('ticketmaster_id', 'is', null)   // Ticketmaster-sourced ONLY — the SpotHero scraper also writes this table (spothero.com URLs), which is what produced the broken "View on Ticketmaster" links.
       .order('first_seen_at', { ascending: false, nullsFirst: false })
       .limit(300)
 
@@ -356,6 +357,7 @@ app.get('/api/events', async (req, res) => {
     const { data: rawEvents } = await supabase
       .from('events')
       .select('id, venue_id, event_name, event_date, onsale_start, public_visibility_start, first_seen_at, source_url, ticketmaster_id')
+      .not('ticketmaster_id', 'is', null)   // Ticketmaster-sourced ONLY (this table also holds SpotHero-scraped events with spothero.com URLs).
       .order('event_date', { ascending: true })
       .limit(500)
 
