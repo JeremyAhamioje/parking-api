@@ -99,6 +99,59 @@ function buildEventReasons(ctx) {
   return reasons
 }
 
+// ---------------------------------------------------------------------------
+// Ticketmaster event surfacing
+//
+// The events table holds every upcoming show at every tracked venue. Dumping
+// that wall undifferentiated is what made the feature feel useless. These
+// helpers turn a raw row into an *actionability* view — is it genuinely new, is
+// the on-sale window opening soon (the earliest "secure passes early" moment),
+// is it already on sale — and a score so the time-sensitive opportunities sort
+// to the top. Past events are dropped at the endpoint level.
+// ---------------------------------------------------------------------------
+const NEW_WINDOW_DAYS  = parseInt(process.env.EVENTS_NEW_DAYS || '10', 10)
+const ONSALE_SOON_DAYS = parseInt(process.env.EVENTS_ONSALE_SOON_DAYS || '14', 10)
+
+function startOfTodayMs() {
+  const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime()
+}
+
+function classifyEvent(e, nowMs) {
+  const eventMs    = e.event_date    ? new Date(e.event_date).getTime()    : NaN
+  const firstSeen  = e.first_seen_at ? new Date(e.first_seen_at).getTime() : NaN
+  const onsaleMs   = e.onsale_start  ? new Date(e.onsale_start).getTime()  : NaN
+
+  const daysUntilEvent  = Number.isNaN(eventMs)   ? null : Math.ceil((eventMs  - nowMs) / 86_400_000)
+  const daysSinceSeen   = Number.isNaN(firstSeen) ? null : Math.floor((nowMs   - firstSeen) / 86_400_000)
+  const daysUntilOnsale = Number.isNaN(onsaleMs)  ? null : Math.ceil((onsaleMs - nowMs) / 86_400_000)
+
+  const isNew            = daysSinceSeen != null && daysSinceSeen <= NEW_WINDOW_DAYS
+  const onsaleUpcoming   = !Number.isNaN(onsaleMs) && onsaleMs > nowMs
+  const onsaleSoon       = onsaleUpcoming && daysUntilOnsale != null && daysUntilOnsale <= ONSALE_SOON_DAYS
+  const onsaleJustOpened = !Number.isNaN(onsaleMs) && onsaleMs <= nowMs && (nowMs - onsaleMs) <= 3 * 86_400_000
+
+  const tags = []
+  if (isNew) tags.push('new')
+  if (onsaleSoon) tags.push('onsale-soon')
+  else if (onsaleUpcoming) tags.push('onsale-scheduled')
+  if (onsaleJustOpened) tags.push('onsale-open')
+
+  let status = 'upcoming'
+  if (onsaleSoon) status = 'secure-early'
+  else if (isNew) status = 'newly-announced'
+  else if (onsaleJustOpened) status = 'on-sale-now'
+
+  // Rank: imminent on-sale (the earliest buy window) first, then fresh
+  // announcements, then just-opened sales; nearer events break ties.
+  let score = 0
+  if (onsaleSoon)       score += 100 - Math.min(daysUntilOnsale ?? 0, 60)
+  if (isNew)            score += 60  - Math.min(daysSinceSeen ?? 0, 30)
+  if (onsaleJustOpened) score += 40
+  if (daysUntilEvent != null) score += Math.max(0, 30 - Math.min(daysUntilEvent, 30)) * 0.5
+
+  return { daysUntilEvent, daysSinceSeen, daysUntilOnsale, isNew, onsaleSoon, onsaleJustOpened, tags, status, score }
+}
+
 // Root endpoint
 app.get('/', (req, res) => {
   res.json({
@@ -234,72 +287,111 @@ app.get('/api/venues', async (req, res) => {
   }
 })
 
-// GET /api/ticketmaster-events - Newly discovered events from Ticketmaster
+// GET /api/ticketmaster-events - The "newly discovered" feed: ONLY genuinely
+// actionable upcoming events (freshly announced, on-sale opening soon, or just
+// opened), newest discoveries first. Past events and the venue's static back
+// catalogue are filtered out so this reads as a heads-up list, not a dump.
 app.get('/api/ticketmaster-events', async (req, res) => {
   try {
-    const { data: events } = await supabase
+    const nowMs = Date.now()
+    const todayMs = startOfTodayMs()
+    const limit = Math.min(parseInt(req.query.limit || '50', 10), 200)
+
+    const { data: rawEvents } = await supabase
       .from('events')
-      .select('id, venue_id, event_name, event_date, source_url, created_at')
-      .order('created_at', { ascending: false })
-      .limit(50)
+      .select('id, venue_id, event_name, event_date, onsale_start, public_visibility_start, first_seen_at, source_url, created_at, ticketmaster_id')
+      .order('first_seen_at', { ascending: false, nullsFirst: false })
+      .limit(300)
 
-    if (!events || events.length === 0) return res.json([])
+    if (!rawEvents || rawEvents.length === 0) return res.json([])
 
-    // Enrich with venue names
-    const enrichedEvents = await Promise.all(
-      events.map(async (event) => {
-        const { data: venue } = await supabase
-          .from('venues')
-          .select('name')
-          .eq('id', event.venue_id)
-          .single()
+    const { data: allVenues } = await supabase.from('venues').select('id, name')
+    const venueMap = Object.fromEntries((allVenues || []).map(v => [v.id, v.name]))
 
-        return {
-          ...event,
-          venue_name: venue?.name || 'Unknown Venue',
-        }
+    const out = []
+    for (const e of rawEvents) {
+      const eventMs = e.event_date ? new Date(e.event_date).getTime() : NaN
+      if (!Number.isNaN(eventMs) && eventMs < todayMs) continue // upcoming only
+      const c = classifyEvent(e, nowMs)
+      if (!c.isNew && !c.onsaleSoon && !c.onsaleJustOpened) continue // actionable only
+      out.push({
+        id: e.id,
+        venue_id: e.venue_id,
+        venue_name: venueMap[e.venue_id] || 'Unknown Venue',
+        event_name: e.event_name,
+        event_date: e.event_date,
+        onsale_start: e.onsale_start || null,
+        source_url: e.source_url,
+        created_at: e.created_at,
+        status: c.status,
+        tags: c.tags,
+        isNew: c.isNew,
+        onsaleSoon: c.onsaleSoon,
+        daysUntilEvent: c.daysUntilEvent,
+        daysUntilOnsale: c.daysUntilOnsale,
+        _score: c.score,
       })
-    )
+    }
 
-    res.json(enrichedEvents)
+    out.sort((a, b) => (b._score - a._score) || (new Date(a.event_date) - new Date(b.event_date)))
+    out.forEach(x => delete x._score)
+    res.json(out.slice(0, limit))
   } catch (error) {
     console.error('Ticketmaster events error:', error)
     res.status(500).json({ error: error.message })
   }
 })
 
-// GET /api/events - Upcoming events (Ticketmaster discoveries)
+// GET /api/events - Upcoming events, ranked by actionability.
+// Past events are dropped (?includePast=1 to keep them). Each row carries a
+// status/tags so the UI can badge "Newly announced / Secure early / On sale now"
+// instead of showing one flat, undated list.
 app.get('/api/events', async (req, res) => {
   try {
-    const { data: events } = await supabase
+    const includePast = req.query.includePast === '1'
+    const limit = Math.min(parseInt(req.query.limit || '60', 10), 200)
+    const nowMs = Date.now()
+    const todayMs = startOfTodayMs()
+
+    const { data: rawEvents } = await supabase
       .from('events')
-      .select('id, venue_id, event_name, event_date, onsale_start, source_url, ticketmaster_id')
+      .select('id, venue_id, event_name, event_date, onsale_start, public_visibility_start, first_seen_at, source_url, ticketmaster_id')
       .order('event_date', { ascending: true })
-      .limit(50)
+      .limit(500)
 
-    if (!events || events.length === 0) return res.json([])
+    if (!rawEvents || rawEvents.length === 0) return res.json([])
 
-    // Enrich with venue names
-    const enrichedEvents = await Promise.all(
-      events.map(async (event) => {
-        const { data: venue } = await supabase
-          .from('venues')
-          .select('name')
-          .eq('id', event.venue_id)
-          .single()
+    const { data: allVenues } = await supabase.from('venues').select('id, name')
+    const venueMap = Object.fromEntries((allVenues || []).map(v => [v.id, v.name]))
 
-        return {
-          id: event.id,
-          name: event.event_name,
-          venue: venue?.name || 'Unknown Venue',
-          eventDate: event.event_date,
-          onSaleDate: event.onsale_start || null,
-          sourceUrl: event.source_url,
-        }
+    const enriched = []
+    for (const e of rawEvents) {
+      const eventMs = e.event_date ? new Date(e.event_date).getTime() : NaN
+      if (!includePast && !Number.isNaN(eventMs) && eventMs < todayMs) continue // drop past events
+      const c = classifyEvent(e, nowMs)
+      enriched.push({
+        id: e.id,
+        name: e.event_name,
+        venue: venueMap[e.venue_id] || 'Unknown Venue',
+        venueId: e.venue_id,
+        eventDate: e.event_date,
+        date: e.event_date,            // legacy field name read by some components
+        onSaleDate: e.onsale_start || null,
+        sourceUrl: e.source_url,
+        ticketmasterId: e.ticketmaster_id,
+        status: c.status,
+        tags: c.tags,
+        isNew: c.isNew,
+        onsaleSoon: c.onsaleSoon,
+        daysUntilEvent: c.daysUntilEvent,
+        daysUntilOnsale: c.daysUntilOnsale,
+        _score: c.score,
       })
-    )
+    }
 
-    res.json(enrichedEvents)
+    enriched.sort((a, b) => (b._score - a._score) || (new Date(a.eventDate) - new Date(b.eventDate)))
+    enriched.forEach(x => delete x._score)
+    res.json(enriched.slice(0, limit))
   } catch (error) {
     console.error('Events error:', error)
     res.status(500).json({ error: error.message })
