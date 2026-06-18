@@ -110,7 +110,10 @@ function buildEventReasons(ctx) {
 // to the top. Past events are dropped at the endpoint level.
 // ---------------------------------------------------------------------------
 const NEW_WINDOW_DAYS  = parseInt(process.env.EVENTS_NEW_DAYS || '10', 10)
-const ONSALE_SOON_DAYS = parseInt(process.env.EVENTS_ONSALE_SOON_DAYS || '14', 10)
+// Lead time for "secure early": surface events whose on-sale opens within this
+// many days. Wide enough to catch the real sweet spot (a few weeks out, e.g. a
+// Christmas show going on sale next month), not just the next fortnight.
+const ONSALE_SOON_DAYS = parseInt(process.env.EVENTS_ONSALE_SOON_DAYS || '60', 10)
 
 function startOfTodayMs() {
   const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime()
@@ -119,7 +122,10 @@ function startOfTodayMs() {
 function classifyEvent(e, nowMs) {
   const eventMs    = e.event_date    ? new Date(e.event_date).getTime()    : NaN
   const firstSeen  = e.first_seen_at ? new Date(e.first_seen_at).getTime() : NaN
-  const onsaleMs   = e.onsale_start  ? new Date(e.onsale_start).getTime()  : NaN
+  let   onsaleMs   = e.onsale_start  ? new Date(e.onsale_start).getTime()  : NaN
+  // Ticketmaster sometimes returns placeholder on-sale dates (e.g. 1900-01-01);
+  // treat anything implausibly old as "no on-sale info" so it can't pollute ranking.
+  if (!Number.isNaN(onsaleMs) && new Date(onsaleMs).getUTCFullYear() < 2005) onsaleMs = NaN
 
   const daysUntilEvent  = Number.isNaN(eventMs)   ? null : Math.ceil((eventMs  - nowMs) / 86_400_000)
   const daysSinceSeen   = Number.isNaN(firstSeen) ? null : Math.floor((nowMs   - firstSeen) / 86_400_000)
@@ -141,15 +147,39 @@ function classifyEvent(e, nowMs) {
   else if (isNew) status = 'newly-announced'
   else if (onsaleJustOpened) status = 'on-sale-now'
 
-  // Rank: imminent on-sale (the earliest buy window) first, then fresh
-  // announcements, then just-opened sales; nearer events break ties.
+  // Rank by ACTIONABILITY, not event proximity. A future on-sale (you can still
+  // get ahead of the parking rush) is the top tier — sooner = more urgent. Then
+  // just-opened sales, then freshly-announced. Event proximity is only a faint
+  // tiebreaker so already-on-sale games happening tomorrow don't crowd out the
+  // genuinely actionable stuff.
   let score = 0
-  if (onsaleSoon)       score += 100 - Math.min(daysUntilOnsale ?? 0, 60)
-  if (isNew)            score += 60  - Math.min(daysSinceSeen ?? 0, 30)
-  if (onsaleJustOpened) score += 40
-  if (daysUntilEvent != null) score += Math.max(0, 30 - Math.min(daysUntilEvent, 30)) * 0.5
+  if (onsaleSoon)            score += 1000 - Math.min(daysUntilOnsale ?? 0, 120)
+  else if (onsaleJustOpened) score += 500
+  if (isNew)                 score += 200 - Math.min(daysSinceSeen ?? 0, 30)
+  if (daysUntilEvent != null) score += Math.max(0, 90 - Math.min(daysUntilEvent, 90)) * 0.1
 
   return { daysUntilEvent, daysSinceSeen, daysUntilOnsale, isNew, onsaleSoon, onsaleJustOpened, tags, status, score }
+}
+
+// Collapse multi-date runs of the SAME event (a residency / a 30-night show like
+// the Christmas Spectacular is 30 separate Ticketmaster events sharing one on-sale
+// date) into ONE representative card, so the feed shows distinct opportunities
+// rather than 30 identical rows. Keeps the highest-scored row (earliest date on a
+// tie) and attaches performanceCount + the date range.
+function collapseEventRuns(rows, { nameKey, venueKey, dateKey, scoreKey = '_score' }) {
+  const groups = new Map()
+  for (const r of rows) {
+    const key = `${String(r[nameKey] || '').toLowerCase()}|${r[venueKey] || ''}`
+    const g = groups.get(key)
+    if (!g) { groups.set(key, { rep: r, count: 1, first: r[dateKey], last: r[dateKey] }); continue }
+    g.count++
+    if (r[dateKey] < g.first) g.first = r[dateKey]
+    if (r[dateKey] > g.last)  g.last = r[dateKey]
+    const better = r[scoreKey] > g.rep[scoreKey] ||
+      (r[scoreKey] === g.rep[scoreKey] && new Date(r[dateKey]) < new Date(g.rep[dateKey]))
+    if (better) g.rep = r
+  }
+  return [...groups.values()].map(g => ({ ...g.rep, performanceCount: g.count, firstDate: g.first, lastDate: g.last }))
 }
 
 // Root endpoint
@@ -334,9 +364,10 @@ app.get('/api/ticketmaster-events', async (req, res) => {
       })
     }
 
-    out.sort((a, b) => (b._score - a._score) || (new Date(a.event_date) - new Date(b.event_date)))
-    out.forEach(x => delete x._score)
-    res.json(out.slice(0, limit))
+    const collapsed = collapseEventRuns(out, { nameKey: 'event_name', venueKey: 'venue_id', dateKey: 'event_date' })
+    collapsed.sort((a, b) => (b._score - a._score) || (new Date(a.event_date) - new Date(b.event_date)))
+    collapsed.forEach(x => delete x._score)
+    res.json(collapsed.slice(0, limit))
   } catch (error) {
     console.error('Ticketmaster events error:', error)
     res.status(500).json({ error: error.message })
@@ -391,9 +422,10 @@ app.get('/api/events', async (req, res) => {
       })
     }
 
-    enriched.sort((a, b) => (b._score - a._score) || (new Date(a.eventDate) - new Date(b.eventDate)))
-    enriched.forEach(x => delete x._score)
-    res.json(enriched.slice(0, limit))
+    const collapsed = collapseEventRuns(enriched, { nameKey: 'name', venueKey: 'venueId', dateKey: 'eventDate' })
+    collapsed.sort((a, b) => (b._score - a._score) || (new Date(a.eventDate) - new Date(b.eventDate)))
+    collapsed.forEach(x => delete x._score)
+    res.json(collapsed.slice(0, limit))
   } catch (error) {
     console.error('Events error:', error)
     res.status(500).json({ error: error.message })
