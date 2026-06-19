@@ -127,6 +127,14 @@ function cleanOnsale(s) {
   return s
 }
 
+// For DISPLAY: only show an on-sale date that's still in the future (an actual
+// "mark your calendar / secure early" signal). A past on-sale date is noise —
+// tickets are already out — so we hide it rather than show "On sale: Jan 23".
+function futureOnsale(s) {
+  const c = cleanOnsale(s)
+  return c && new Date(c).getTime() > Date.now() ? c : null
+}
+
 const ONSALE_RECENT_DAYS = parseInt(process.env.EVENTS_ONSALE_RECENT_DAYS || '7', 10)
 
 function classifyEvent(e, nowMs) {
@@ -182,7 +190,7 @@ function classifyEvent(e, nowMs) {
 // date) into ONE representative card, so the feed shows distinct opportunities
 // rather than 30 identical rows. Keeps the highest-scored row (earliest date on a
 // tie) and attaches performanceCount + the date range.
-function collapseEventRuns(rows, { nameKey, venueKey, dateKey, scoreKey = '_score' }) {
+function collapseEventRuns(rows, { nameKey, venueKey, dateKey, scoreKey = '_score', repBy = 'score' }) {
   const groups = new Map()
   for (const r of rows) {
     const key = `${String(r[nameKey] || '').toLowerCase()}|${r[venueKey] || ''}`
@@ -191,9 +199,14 @@ function collapseEventRuns(rows, { nameKey, venueKey, dateKey, scoreKey = '_scor
     g.count++
     if (r[dateKey] < g.first) g.first = r[dateKey]
     if (r[dateKey] > g.last)  g.last = r[dateKey]
-    const better = r[scoreKey] > g.rep[scoreKey] ||
-      (r[scoreKey] === g.rep[scoreKey] && new Date(r[dateKey]) < new Date(g.rep[dateKey]))
-    if (better) g.rep = r
+    // repBy 'first' keeps the first-encountered row as representative (caller
+    // pre-sorts, e.g. by date → earliest performance wins); 'score' keeps the
+    // highest-scored (earliest date breaks ties).
+    if (repBy === 'score') {
+      const better = r[scoreKey] > g.rep[scoreKey] ||
+        (r[scoreKey] === g.rep[scoreKey] && new Date(r[dateKey]) < new Date(g.rep[dateKey]))
+      if (better) g.rep = r
+    }
   }
   return [...groups.values()].map(g => ({ ...g.rep, performanceCount: g.count, firstDate: g.first, lastDate: g.last }))
 }
@@ -367,7 +380,7 @@ app.get('/api/ticketmaster-events', async (req, res) => {
         venue_name: venueMap[e.venue_id] || 'Unknown Venue',
         event_name: e.event_name,
         event_date: e.event_date,
-        onsale_start: cleanOnsale(e.onsale_start),
+        onsale_start: futureOnsale(e.onsale_start),
         source_url: e.source_url,
         created_at: e.created_at,
         status: c.status,
@@ -390,14 +403,16 @@ app.get('/api/ticketmaster-events', async (req, res) => {
   }
 })
 
-// GET /api/events - Upcoming events, ranked by actionability.
-// Past events are dropped (?includePast=1 to keep them). Each row carries a
-// status/tags so the UI can badge "Newly announced / Secure early / On sale now"
-// instead of showing one flat, undated list.
+// GET /api/events - Upcoming events at tracked venues, SOONEST FIRST. Every
+// upcoming event is a parking opportunity, so we don't filter by ticket on-sale
+// timing (only ~2 events ever have a future on-sale anyway). Each row still
+// carries a status so the UI can badge the rare "Secure early" gems; the on-sale
+// date is surfaced only when it's still in the future. Past events dropped
+// (?includePast=1 to keep).
 app.get('/api/events', async (req, res) => {
   try {
     const includePast = req.query.includePast === '1'
-    const limit = Math.min(parseInt(req.query.limit || '60', 10), 200)
+    const limit = Math.min(parseInt(req.query.limit || '100', 10), 300)
     const nowMs = Date.now()
     const todayMs = startOfTodayMs()
 
@@ -425,7 +440,7 @@ app.get('/api/events', async (req, res) => {
         venueId: e.venue_id,
         eventDate: e.event_date,
         date: e.event_date,            // legacy field name read by some components
-        onSaleDate: cleanOnsale(e.onsale_start),
+        onSaleDate: futureOnsale(e.onsale_start),
         sourceUrl: e.source_url,
         ticketmasterId: e.ticketmaster_id,
         status: c.status,
@@ -438,8 +453,11 @@ app.get('/api/events', async (req, res) => {
       })
     }
 
-    const collapsed = collapseEventRuns(enriched, { nameKey: 'name', venueKey: 'venueId', dateKey: 'eventDate' })
-    collapsed.sort((a, b) => (b._score - a._score) || (new Date(a.eventDate) - new Date(b.eventDate)))
+    // Soonest-first calendar: sort by date, then collapse multi-date runs keeping
+    // the earliest performance as the representative.
+    enriched.sort((a, b) => new Date(a.eventDate) - new Date(b.eventDate))
+    const collapsed = collapseEventRuns(enriched, { nameKey: 'name', venueKey: 'venueId', dateKey: 'eventDate', repBy: 'first' })
+    collapsed.sort((a, b) => new Date(a.eventDate) - new Date(b.eventDate))
     collapsed.forEach(x => delete x._score)
     res.json(collapsed.slice(0, limit))
   } catch (error) {
