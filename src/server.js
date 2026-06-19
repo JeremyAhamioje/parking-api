@@ -1283,10 +1283,12 @@ app.get('/api/alerts', async (req, res) => {
   try {
     const { read, limit = 20 } = req.query
 
-    let query = supabase.from('alerts').select('id, type, venue_id, facility_id, message, metadata, created_at, read')
+    // NB: the column is is_read (not read) — selecting the wrong name errors the
+    // whole query and silently returns an empty alerts feed.
+    let query = supabase.from('alerts').select('id, type, venue_id, facility_id, message, metadata, created_at, is_read')
 
     if (read === 'false') {
-      query = query.eq('read', false)
+      query = query.eq('is_read', false)
     }
 
     const { data: alerts } = await query
@@ -1319,11 +1321,12 @@ app.get('/api/alerts', async (req, res) => {
         return {
           id: alert.id,
           type: alert.type,
-          venue: venue?.name || 'Unknown',
+          // change-detection alerts carry venue_id=null but stash the name in metadata
+          venue: venue?.name || alert.metadata?.venue_name || 'Unknown',
           message: alert.message,
           value: alert.metadata?.delta ? `$${Math.abs(alert.metadata.delta).toFixed(2)}` : 'N/A',
           time: timeStr,
-          read: alert.read || false,
+          read: alert.is_read || false,
         }
       })
     )
