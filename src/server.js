@@ -119,22 +119,34 @@ function startOfTodayMs() {
   const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime()
 }
 
+// Treat Ticketmaster placeholder on-sale dates (e.g. 1900-01-01) as "no info".
+function cleanOnsale(s) {
+  if (!s) return null
+  const t = new Date(s).getTime()
+  if (Number.isNaN(t) || new Date(t).getUTCFullYear() < 2005) return null
+  return s
+}
+
+const ONSALE_RECENT_DAYS = parseInt(process.env.EVENTS_ONSALE_RECENT_DAYS || '7', 10)
+
 function classifyEvent(e, nowMs) {
   const eventMs    = e.event_date    ? new Date(e.event_date).getTime()    : NaN
   const firstSeen  = e.first_seen_at ? new Date(e.first_seen_at).getTime() : NaN
-  let   onsaleMs   = e.onsale_start  ? new Date(e.onsale_start).getTime()  : NaN
-  // Ticketmaster sometimes returns placeholder on-sale dates (e.g. 1900-01-01);
-  // treat anything implausibly old as "no on-sale info" so it can't pollute ranking.
-  if (!Number.isNaN(onsaleMs) && new Date(onsaleMs).getUTCFullYear() < 2005) onsaleMs = NaN
+  const onsaleMs   = cleanOnsale(e.onsale_start) ? new Date(e.onsale_start).getTime() : NaN
 
   const daysUntilEvent  = Number.isNaN(eventMs)   ? null : Math.ceil((eventMs  - nowMs) / 86_400_000)
   const daysSinceSeen   = Number.isNaN(firstSeen) ? null : Math.floor((nowMs   - firstSeen) / 86_400_000)
   const daysUntilOnsale = Number.isNaN(onsaleMs)  ? null : Math.ceil((onsaleMs - nowMs) / 86_400_000)
 
-  const isNew            = daysSinceSeen != null && daysSinceSeen <= NEW_WINDOW_DAYS
   const onsaleUpcoming   = !Number.isNaN(onsaleMs) && onsaleMs > nowMs
   const onsaleSoon       = onsaleUpcoming && daysUntilOnsale != null && daysUntilOnsale <= ONSALE_SOON_DAYS
-  const onsaleJustOpened = !Number.isNaN(onsaleMs) && onsaleMs <= nowMs && (nowMs - onsaleMs) <= 3 * 86_400_000
+  const onsaleJustOpened = !Number.isNaN(onsaleMs) && onsaleMs <= nowMs && (nowMs - onsaleMs) <= ONSALE_RECENT_DAYS * 86_400_000
+  // Tickets that went on sale a while ago — there's no "secure early" left, and an
+  // event whose tickets sold weeks ago is NOT newly announced no matter when WE
+  // first saw it (our first_seen reflects discovery time, not TM's announcement).
+  const onsaleStale      = !Number.isNaN(onsaleMs) && (nowMs - onsaleMs) > ONSALE_RECENT_DAYS * 86_400_000
+
+  const isNew = daysSinceSeen != null && daysSinceSeen <= NEW_WINDOW_DAYS && !onsaleStale
 
   const tags = []
   if (isNew) tags.push('new')
@@ -144,8 +156,8 @@ function classifyEvent(e, nowMs) {
 
   let status = 'upcoming'
   if (onsaleSoon) status = 'secure-early'
-  else if (isNew) status = 'newly-announced'
   else if (onsaleJustOpened) status = 'on-sale-now'
+  else if (isNew) status = 'newly-announced'
 
   // Rank by ACTIONABILITY, not event proximity. A future on-sale (you can still
   // get ahead of the parking rush) is the top tier — sooner = more urgent. Then
@@ -351,7 +363,7 @@ app.get('/api/ticketmaster-events', async (req, res) => {
         venue_name: venueMap[e.venue_id] || 'Unknown Venue',
         event_name: e.event_name,
         event_date: e.event_date,
-        onsale_start: e.onsale_start || null,
+        onsale_start: cleanOnsale(e.onsale_start),
         source_url: e.source_url,
         created_at: e.created_at,
         status: c.status,
@@ -409,7 +421,7 @@ app.get('/api/events', async (req, res) => {
         venueId: e.venue_id,
         eventDate: e.event_date,
         date: e.event_date,            // legacy field name read by some components
-        onSaleDate: e.onsale_start || null,
+        onSaleDate: cleanOnsale(e.onsale_start),
         sourceUrl: e.source_url,
         ticketmasterId: e.ticketmaster_id,
         status: c.status,
