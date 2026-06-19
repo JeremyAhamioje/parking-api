@@ -110,29 +110,45 @@ function buildEventReasons(ctx) {
 // to the top. Past events are dropped at the endpoint level.
 // ---------------------------------------------------------------------------
 const NEW_WINDOW_DAYS  = parseInt(process.env.EVENTS_NEW_DAYS || '10', 10)
-// Lead time for "secure early": surface events whose on-sale opens within this
-// many days. Wide enough to catch the real sweet spot (a few weeks out, e.g. a
-// Christmas show going on sale next month), not just the next fortnight.
-const ONSALE_SOON_DAYS = parseInt(process.env.EVENTS_ONSALE_SOON_DAYS || '60', 10)
+// Lead time for "secure early": any event whose on-sale is still in the future is
+// a get-ahead opportunity, so this window is wide (a year). It only governs the
+// "secure-early" badge/status; the events feed already filters to future on-sale.
+const ONSALE_SOON_DAYS = parseInt(process.env.EVENTS_ONSALE_SOON_DAYS || '365', 10)
 
 function startOfTodayMs() {
   const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime()
 }
 
-// Treat Ticketmaster placeholder on-sale dates (e.g. 1900-01-01) as "no info".
+// Ticketmaster uses placeholder on-sale dates: 1900-01-01 ("no info") and
+// 9999-12-31 ("on-sale not yet scheduled / TBD"). cleanOnsale rejects BOTH so a
+// real, plausible date is the only thing that survives for ranking/display.
 function cleanOnsale(s) {
   if (!s) return null
   const t = new Date(s).getTime()
-  if (Number.isNaN(t) || new Date(t).getUTCFullYear() < 2005) return null
+  if (Number.isNaN(t)) return null
+  const yr = new Date(t).getUTCFullYear()
+  if (yr < 2005 || yr > 2100) return null
   return s
 }
 
-// For DISPLAY: only show an on-sale date that's still in the future (an actual
-// "mark your calendar / secure early" signal). A past on-sale date is noise —
-// tickets are already out — so we hide it rather than show "On sale: Jan 23".
+// For DISPLAY: only a still-in-the-future real on-sale date (a "mark your calendar"
+// signal). Past on-sale = noise (tickets already out); placeholders → null.
 function futureOnsale(s) {
   const c = cleanOnsale(s)
   return c && new Date(c).getTime() > Date.now() ? c : null
+}
+
+// The 9999-style "on-sale TBD" placeholder = tickets scheduled but no date yet.
+function isOnsaleTBD(s) {
+  if (!s) return false
+  const t = new Date(s).getTime()
+  return !Number.isNaN(t) && new Date(t).getUTCFullYear() > 2100
+}
+
+// "Tickets NOT yet on sale" = a real future on-sale date OR a TBD placeholder.
+// (A 1900 placeholder or a real past date means tickets are already out → false.)
+function ticketsNotYetOnSale(s) {
+  return !!futureOnsale(s) || isOnsaleTBD(s)
 }
 
 const ONSALE_RECENT_DAYS = parseInt(process.env.EVENTS_ONSALE_RECENT_DAYS || '7', 10)
@@ -403,15 +419,16 @@ app.get('/api/ticketmaster-events', async (req, res) => {
   }
 })
 
-// GET /api/events - Upcoming events at tracked venues, SOONEST FIRST. Every
-// upcoming event is a parking opportunity, so we don't filter by ticket on-sale
-// timing (only ~2 events ever have a future on-sale anyway). Each row still
-// carries a status so the UI can badge the rare "Secure early" gems; the on-sale
-// date is surfaced only when it's still in the future. Past events dropped
-// (?includePast=1 to keep).
+// GET /api/events - "Secure early" feed: ONLY events whose tickets are not yet on
+// sale (on-sale date still in the future). These are the genuine get-ahead-of-it
+// opportunities — grab parking before tickets drop and demand spikes. Ranked by
+// soonest on-sale first. Today there are ~2 (e.g. Christmas Spectacular, NY Comic
+// Con); the feed grows as venues announce new shows. ?all=1 returns every upcoming
+// event (the full calendar) instead.
 app.get('/api/events', async (req, res) => {
   try {
     const includePast = req.query.includePast === '1'
+    const showAll = req.query.all === '1'
     const limit = Math.min(parseInt(req.query.limit || '100', 10), 300)
     const nowMs = Date.now()
     const todayMs = startOfTodayMs()
@@ -432,6 +449,7 @@ app.get('/api/events', async (req, res) => {
     for (const e of rawEvents) {
       const eventMs = e.event_date ? new Date(e.event_date).getTime() : NaN
       if (!includePast && !Number.isNaN(eventMs) && eventMs < todayMs) continue // drop past events
+      if (!showAll && !ticketsNotYetOnSale(e.onsale_start)) continue // secure-early only: tickets not yet on sale (future date or TBD)
       const c = classifyEvent(e, nowMs)
       enriched.push({
         id: e.id,
@@ -441,9 +459,11 @@ app.get('/api/events', async (req, res) => {
         eventDate: e.event_date,
         date: e.event_date,            // legacy field name read by some components
         onSaleDate: futureOnsale(e.onsale_start),
+        onsaleTBD: isOnsaleTBD(e.onsale_start),
         sourceUrl: e.source_url,
         ticketmasterId: e.ticketmaster_id,
-        status: c.status,
+        // In the secure-early feed every event is "tickets not yet on sale" → badge it as such.
+        status: showAll ? c.status : 'secure-early',
         tags: c.tags,
         isNew: c.isNew,
         onsaleSoon: c.onsaleSoon,
@@ -453,11 +473,20 @@ app.get('/api/events', async (req, res) => {
       })
     }
 
-    // Soonest-first calendar: sort by date, then collapse multi-date runs keeping
-    // the earliest performance as the representative.
-    enriched.sort((a, b) => new Date(a.eventDate) - new Date(b.eventDate))
+    // Rank by soonest ON-SALE first (when tickets drop = when to act). Events with
+    // a concrete future on-sale come first by that date; TBD-on-sale events fall to
+    // the end (by event date). ?all=1 (full calendar) sorts by soonest event date.
+    const sortKey = showAll
+      ? (a, b) => new Date(a.eventDate) - new Date(b.eventDate)
+      : (a, b) => {
+          if (a.onSaleDate && b.onSaleDate) return new Date(a.onSaleDate) - new Date(b.onSaleDate)
+          if (a.onSaleDate) return -1
+          if (b.onSaleDate) return 1
+          return new Date(a.eventDate) - new Date(b.eventDate)
+        }
+    enriched.sort(sortKey)
     const collapsed = collapseEventRuns(enriched, { nameKey: 'name', venueKey: 'venueId', dateKey: 'eventDate', repBy: 'first' })
-    collapsed.sort((a, b) => new Date(a.eventDate) - new Date(b.eventDate))
+    collapsed.sort(sortKey)
     collapsed.forEach(x => delete x._score)
     res.json(collapsed.slice(0, limit))
   } catch (error) {
