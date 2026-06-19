@@ -433,12 +433,20 @@ app.get('/api/events', async (req, res) => {
     const nowMs = Date.now()
     const todayMs = startOfTodayMs()
 
-    const { data: rawEvents } = await supabase
+    // Secure-early mode: filter "tickets not yet on sale" in the QUERY, not after a
+    // date-ordered limit. `onsale_start > now()` matches future real dates AND the
+    // 9999 TBD placeholder, while excluding past/1900/null. Critically, doing it in
+    // SQL means far-future shows (a November residency, an October convention) can't
+    // be cut off by the row limit — which was leaving only a near-term event in the
+    // feed. ?all=1 returns the full upcoming calendar by date instead.
+    let q = supabase
       .from('events')
       .select('id, venue_id, event_name, event_date, onsale_start, public_visibility_start, first_seen_at, source_url, ticketmaster_id')
       .not('ticketmaster_id', 'is', null)   // Ticketmaster-sourced ONLY (this table also holds SpotHero-scraped events with spothero.com URLs).
-      .order('event_date', { ascending: true })
-      .limit(500)
+    if (!showAll) q = q.gt('onsale_start', new Date(nowMs).toISOString())
+    const { data: rawEvents } = await q
+      .order(showAll ? 'event_date' : 'onsale_start', { ascending: true })
+      .limit(showAll ? 500 : 1000)
 
     if (!rawEvents || rawEvents.length === 0) return res.json([])
 
