@@ -1254,40 +1254,55 @@ app.get('/api/event-sentiment/:eventId', async (req, res) => {
   }
 })
 
-// GET /api/signals - High profile venue signals (change detection)
+// GET /api/signals - High-profile venue signals (change detection)
+// Sourced from the alerts table (the venue_signals table was never created in
+// prod). Change-detection writes price/inventory alerts whose metadata carries the
+// full signal payload (signal_type, before/after, event correlation); we surface
+// exactly those (identified by metadata.signal_type) in the legacy signals shape.
 app.get('/api/signals', async (req, res) => {
   try {
-    const { data: signals } = await supabase
-      .from('venue_signals')
-      .select('*')
-      .eq('resolved', false)
-      .order('tagged_at', { ascending: false })
-      .limit(50)
+    const { data: alerts } = await supabase
+      .from('alerts')
+      .select('id, type, venue_id, message, metadata, created_at')
+      .in('type', ['price_spike', 'availability_drop'])
+      .order('created_at', { ascending: false })
+      .limit(300)
 
-    if (!signals || signals.length === 0) return res.json([])
+    const num = v => (v === null || v === undefined ? null : Number(v))
 
-    const enriched = signals.map(signal => ({
-      id: signal.id,
-      venue: signal.venue_name,
-      lot: signal.lot_address,
-      signalType: signal.signal_type,
-      priceBefore: signal.price_before,
-      priceAfter: signal.price_after,
-      priceChangePct: signal.price_change_pct,
-      spacesBefore: signal.spaces_before,
-      spacesAfter: signal.spaces_after,
-      spacesChangePct: signal.spaces_change_pct,
-      timestamp: signal.tagged_at,
-      severity: Math.max(
-        Math.abs(signal.price_change_pct),
-        Math.abs(signal.spaces_change_pct)
-      ),
-    }))
+    const enriched = (alerts || [])
+      .filter(a => a.metadata && a.metadata.signal_type)   // change-detection signals only
+      .map(a => {
+        const m = a.metadata
+        const priceChangePct = num(m.price_change_pct) ?? 0
+        const spacesChangePct = num(m.spaces_change_pct) ?? 0
+        return {
+          id: a.id,
+          venue: m.venue_name || 'Unknown',
+          lot: m.facility_name || m.address || 'lot',
+          signalType: m.signal_type,
+          priceBefore: num(m.price_before),
+          priceAfter: num(m.price_after),
+          priceChangePct,
+          spacesBefore: num(m.spaces_before),
+          spacesAfter: num(m.spaces_after),
+          spacesChangePct,
+          timestamp: a.created_at,
+          // event correlation (null when the move had no nearby event)
+          eventCorrelated: !!m.event_correlated,
+          eventName: m.event_name || null,
+          eventDate: m.event_date || null,
+          eventDaysUntil: m.event_days_until ?? null,
+          severity: Math.max(Math.abs(priceChangePct), Math.abs(spacesChangePct)),
+        }
+      })
 
-    // Sort by severity descending
-    enriched.sort((a, b) => b.severity - a.severity)
+    if (enriched.length === 0) return res.json([])
 
-    res.json(enriched)
+    // Event-correlated signals first, then by severity.
+    enriched.sort((a, b) => (Number(b.eventCorrelated) - Number(a.eventCorrelated)) || (b.severity - a.severity))
+
+    res.json(enriched.slice(0, 50))
   } catch (error) {
     console.error('Signals error:', error)
     res.status(500).json({ error: error.message })
