@@ -146,7 +146,11 @@ function classifyEvent(e, nowMs) {
   // first saw it (our first_seen reflects discovery time, not TM's announcement).
   const onsaleStale      = !Number.isNaN(onsaleMs) && (nowMs - onsaleMs) > ONSALE_RECENT_DAYS * 86_400_000
 
-  const isNew = daysSinceSeen != null && daysSinceSeen <= NEW_WINDOW_DAYS && !onsaleStale
+  // "Newly announced" requires a VALID on-sale date. Without one we can't tell a
+  // genuinely-fresh announcement from an old event we merely discovered late
+  // (first_seen is our import time, not TM's announcement). So bogus/unknown
+  // on-sale (e.g. 1900 placeholder) → plain "upcoming", not a false "new" badge.
+  const isNew = daysSinceSeen != null && daysSinceSeen <= NEW_WINDOW_DAYS && !onsaleStale && !Number.isNaN(onsaleMs)
 
   const tags = []
   if (isNew) tags.push('new')
