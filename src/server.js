@@ -901,7 +901,7 @@ app.get('/api/facility-price-log/:venueId/:facilityId', async (req, res) => {
 // Used by BOTH /api/event-stats (the table) and the /api/event-sentiment
 // endpoints (the LLM input) so the model reads the EXACT numbers the UI shows —
 // one source of truth, no drift. Returns { venues, events, venueNameMap }.
-async function computeEventStats() {
+async function computeEventStats(source = null) {
   {
     // 1. Venues (id → name)
     const { data: allVenues } = await supabase.from('venues').select('id, name')
@@ -929,13 +929,15 @@ async function computeEventStats() {
     let snaps = []
     const SN_PAGE = 1000
     for (let from = 0; ; from += SN_PAGE) {
-      const { data: page, error } = await supabase
+      let snapQuery = supabase
         .from('snapshots')
         .select('event_id, venue_id, facility_id, facility_name, total_price, available_spaces, scraped_at')
         .not('event_id', 'is', null)
         .order('event_id', { ascending: true })
         .order('scraped_at', { ascending: true })
         .range(from, from + SN_PAGE - 1)
+      if (source) snapQuery = snapQuery.eq('source', source) // scope to one platform
+      const { data: page, error } = await snapQuery
       if (error) throw new Error(error.message)
       if (!page || page.length === 0) break
       snaps = snaps.concat(page)
@@ -955,10 +957,14 @@ async function computeEventStats() {
     let stats = []
     const ST_PAGE = 1000
     for (let from = 0; ; from += ST_PAGE) {
-      const { data: page, error } = await supabase
+      let statQuery = supabase
         .from('facility_stats')
         .select('venue_id, facility_id, generic_avg_price')
         .range(from, from + ST_PAGE - 1)
+      // Match the baseline to the same platform so the premium is apples-to-apples
+      // (a facility_id can recur across sources under different pricing).
+      if (source) statQuery = statQuery.eq('source', source)
+      const { data: page, error } = await statQuery
       if (error) break // baselines are optional; premiums just show as pending
       if (!page || page.length === 0) break
       stats = stats.concat(page)
@@ -1136,9 +1142,13 @@ async function computeEventStats() {
 }
 
 // GET /api/event-stats — the price-trends "By Event" table reads this.
+// Optional ?source=spothero|parkwhiz|way scopes the view to one platform (the
+// per-platform data pages pass it); anything else → all sources (SpotHero page).
+const EVENT_STATS_SOURCES = new Set(['spothero', 'parkwhiz', 'way'])
 app.get('/api/event-stats', async (req, res) => {
   try {
-    const { venues, message } = await computeEventStats()
+    const source = EVENT_STATS_SOURCES.has(req.query.source) ? req.query.source : null
+    const { venues, message } = await computeEventStats(source)
     return res.json(message ? { venues, message } : { venues })
   } catch (error) {
     console.error('event-stats error:', error)
