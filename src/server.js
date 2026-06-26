@@ -1377,14 +1377,29 @@ app.get('/api/signals', async (req, res) => {
 // GET /api/alerts - Recent alerts
 app.get('/api/alerts', async (req, res) => {
   try {
-    const { read, limit = 50 } = req.query
+    const { read, limit = 50, category, context, source, since } = req.query
 
     // NB: the column is is_read (not read) — selecting the wrong name errors the
     // whole query and silently returns an empty alerts feed.
     let query = supabase.from('alerts').select('id, type, venue_id, facility_id, message, metadata, created_at, is_read')
 
-    if (read === 'false') {
-      query = query.eq('is_read', false)
+    if (read === 'false') query = query.eq('is_read', false)
+
+    // Category tab — server-side so high-value alerts surface even when buried.
+    if (category === 'soldout') {
+      query = query.or('metadata->>signal_type.eq.SOLD_OUT,metadata->>signal_type.eq.INVENTORY_THINNING')
+    } else if (category === 'volatility') {
+      query = query.eq('type', 'price_spike')      // all price jumps
+    } else if (category === 'pricedrop') {
+      query = query.eq('type', 'price_drop')
+    }
+
+    // Provenance + time filters (context/source only match newly-tagged alerts).
+    if (context === 'event' || context === 'generic') query = query.eq('metadata->>context', context)
+    if (['spothero', 'parkwhiz', 'way'].includes(source)) query = query.eq('metadata->>source', source)
+    if (since) {
+      const hours = parseFloat(since)
+      if (hours > 0) query = query.gte('created_at', new Date(Date.now() - hours * 3600000).toISOString())
     }
 
     const { data: alerts } = await query
@@ -1420,6 +1435,11 @@ app.get('/api/alerts', async (req, res) => {
           createdAt: alert.created_at,
           time: alert.created_at,
           window: { from: fromIso, to: toIso }, // from may be null (no exact prior run)
+          // Provenance for the per-alert label + filters.
+          source: m.source || null,
+          context: m.context || 'generic',
+          signalType: m.signal_type || null,
+          eventName: m.event_name || null,
           read: alert.is_read || false,
         }
       })
