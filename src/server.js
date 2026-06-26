@@ -1377,7 +1377,7 @@ app.get('/api/signals', async (req, res) => {
 // GET /api/alerts - Recent alerts
 app.get('/api/alerts', async (req, res) => {
   try {
-    const { read, limit = 20 } = req.query
+    const { read, limit = 50 } = req.query
 
     // NB: the column is is_read (not read) — selecting the wrong name errors the
     // whole query and silently returns an empty alerts feed.
@@ -1402,26 +1402,24 @@ app.get('/api/alerts', async (req, res) => {
           .eq('id', alert.venue_id)
           .single()
 
-        const createdDate = new Date(alert.created_at)
-        const now = new Date()
-        const diffMs = now - createdDate
-        const diffMins = Math.floor(diffMs / 60000)
-        const diffHours = Math.floor(diffMs / 3600000)
-        const diffDays = Math.floor(diffMs / 86400000)
-
-        let timeStr = 'just now'
-        if (diffMins > 0) timeStr = `${diffMins} minute${diffMins > 1 ? 's' : ''} ago`
-        if (diffHours > 0) timeStr = `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`
-        if (diffDays > 0) timeStr = `${diffDays} day${diffDays > 1 ? 's' : ''} ago`
+        const m = alert.metadata || {}
+        // The two runs being compared (prev run → this run), when known. Producers
+        // stamp these into metadata; change-detection has only the "after" run.
+        const fromIso = m.prev_scraped_at || null
+        const toIso = m.new_scraped_at || m.latest_scraped_at || alert.created_at
 
         return {
           id: alert.id,
           type: alert.type,
           // change-detection alerts carry venue_id=null but stash the name in metadata
-          venue: venue?.name || alert.metadata?.venue_name || 'Unknown',
+          venue: venue?.name || m.venue_name || 'Unknown',
           message: alert.message,
-          value: alert.metadata?.delta ? `$${Math.abs(alert.metadata.delta).toFixed(2)}` : 'N/A',
-          time: timeStr,
+          value: m.delta ? `$${Math.abs(m.delta).toFixed(2)}` : 'N/A',
+          // Raw ISO — the UI formats in the viewer's timezone. `time` kept as an
+          // ISO fallback for older clients during deploy skew.
+          createdAt: alert.created_at,
+          time: alert.created_at,
+          window: { from: fromIso, to: toIso }, // from may be null (no exact prior run)
           read: alert.is_read || false,
         }
       })
@@ -1430,6 +1428,38 @@ app.get('/api/alerts', async (req, res) => {
     res.json(enrichedAlerts)
   } catch (error) {
     console.error('Alerts error:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// GET /api/alerts/unread-count — drives the navbar bell badge.
+app.get('/api/alerts/unread-count', async (req, res) => {
+  try {
+    const { count } = await supabase
+      .from('alerts')
+      .select('id', { count: 'exact', head: true })
+      .eq('is_read', false)
+    res.json({ count: count || 0 })
+  } catch (error) {
+    console.error('Alerts unread-count error:', error)
+    res.json({ count: 0 })
+  }
+})
+
+// POST /api/alerts/read — mark alerts read (persisted in is_read). Body { ids? }:
+// specific ids, or omit to mark ALL unread as read. Alerts are NEVER deleted —
+// this only flips is_read, so the history stays in the DB and the unread badge
+// reflects what you've acknowledged.
+app.post('/api/alerts/read', async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : null
+    let q = supabase.from('alerts').update({ is_read: true })
+    q = ids ? q.in('id', ids) : q.eq('is_read', false)
+    const { error } = await q
+    if (error) throw error
+    res.json({ ok: true })
+  } catch (error) {
+    console.error('Alerts mark-read error:', error)
     res.status(500).json({ error: error.message })
   }
 })
