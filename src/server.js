@@ -1397,7 +1397,10 @@ function resolveListingUrl(m) {
 // GET /api/alerts - Recent alerts
 app.get('/api/alerts', async (req, res) => {
   try {
-    const { read, limit = 50, category, context, source, since } = req.query
+    const { read, limit, category, context, source, since } = req.query
+    // Default 200 (was 50, which hid most of the feed); hard-capped so a huge
+    // ?limit can't pull the whole table. The page-level filters keep it scoped.
+    const lim = Math.min(parseInt(limit) || 200, 1000)
 
     // NB: the column is is_read (not read) — selecting the wrong name errors the
     // whole query and silently returns an empty alerts feed.
@@ -1424,7 +1427,7 @@ app.get('/api/alerts', async (req, res) => {
 
     const { data: alerts } = await query
       .order('created_at', { ascending: false })
-      .limit(parseInt(limit))
+      .limit(lim)
 
     if (!alerts) return res.json([])
 
