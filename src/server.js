@@ -1379,12 +1379,15 @@ app.get('/api/signals', async (req, res) => {
 })
 
 // Resolve the best "open this listing" link for an alert from its metadata.
-// Exact lot URL wins (ParkWhiz). Otherwise the event page — but ONLY if it points
-// at the same platform we'd buy from, so a SpotHero alert never links to a
-// Ticketmaster/ParkWhiz page. Returns { url, kind } or null.
+// Way/ParkWhiz expose an exact-lot URL; SpotHero's listing_url is the event MAP
+// (it has no per-lot URL), so it's labelled event-level — otherwise the button
+// wrongly reads "Open lot" for a page that's actually the whole event. The
+// event_url fallback only fires when it points at the SAME platform we'd buy from,
+// so a SpotHero alert never links to a Ticketmaster/ParkWhiz page. Returns
+// { url, kind } or null.
 const PLATFORM_DOMAIN = { spothero: 'spothero.com', parkwhiz: 'parkwhiz.com', way: 'way.com' }
 function resolveListingUrl(m) {
-  if (m.listing_url) return { url: m.listing_url, kind: 'exact' }
+  if (m.listing_url) return { url: m.listing_url, kind: m.source === 'spothero' ? 'event' : 'exact' }
   const ev = m.event_url
   const dom = PLATFORM_DOMAIN[m.source]
   if (ev && dom && ev.includes(dom)) return { url: ev, kind: 'event' }
