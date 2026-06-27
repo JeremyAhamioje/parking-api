@@ -399,6 +399,7 @@ app.get('/api/ticketmaster-events', async (req, res) => {
         onsale_start: futureOnsale(e.onsale_start),
         source_url: e.source_url,
         created_at: e.created_at,
+        discoveredAt: e.first_seen_at || e.created_at || null,
         status: c.status,
         tags: c.tags,
         isNew: c.isNew,
@@ -441,7 +442,7 @@ app.get('/api/events', async (req, res) => {
     // feed. ?all=1 returns the full upcoming calendar by date instead.
     let q = supabase
       .from('events')
-      .select('id, venue_id, event_name, event_date, onsale_start, public_visibility_start, first_seen_at, source_url, ticketmaster_id')
+      .select('id, venue_id, event_name, event_date, onsale_start, public_visibility_start, first_seen_at, created_at, source_url, ticketmaster_id')
       .not('ticketmaster_id', 'is', null)   // Ticketmaster-sourced ONLY (this table also holds SpotHero-scraped events with spothero.com URLs).
     if (!showAll) q = q.gt('onsale_start', new Date(nowMs).toISOString())
     const { data: rawEvents } = await q
@@ -469,6 +470,9 @@ app.get('/api/events', async (req, res) => {
         onSaleDate: futureOnsale(e.onsale_start),
         onsaleTBD: isOnsaleTBD(e.onsale_start),
         sourceUrl: e.source_url,
+        // When discovery first saw this event (first_seen_at), falling back to the
+        // row's creation time. Drives the "Discovered" stamp + filter on the UI.
+        discoveredAt: e.first_seen_at || e.created_at || null,
         ticketmasterId: e.ticketmaster_id,
         // In the secure-early feed every event is "tickets not yet on sale" → badge it as such.
         status: showAll ? c.status : 'secure-early',
@@ -1374,6 +1378,19 @@ app.get('/api/signals', async (req, res) => {
   }
 })
 
+// Resolve the best "open this listing" link for an alert from its metadata.
+// Exact lot URL wins (ParkWhiz). Otherwise the event page — but ONLY if it points
+// at the same platform we'd buy from, so a SpotHero alert never links to a
+// Ticketmaster/ParkWhiz page. Returns { url, kind } or null.
+const PLATFORM_DOMAIN = { spothero: 'spothero.com', parkwhiz: 'parkwhiz.com', way: 'way.com' }
+function resolveListingUrl(m) {
+  if (m.listing_url) return { url: m.listing_url, kind: 'exact' }
+  const ev = m.event_url
+  const dom = PLATFORM_DOMAIN[m.source]
+  if (ev && dom && ev.includes(dom)) return { url: ev, kind: 'event' }
+  return null
+}
+
 // GET /api/alerts - Recent alerts
 app.get('/api/alerts', async (req, res) => {
   try {
@@ -1439,7 +1456,10 @@ app.get('/api/alerts', async (req, res) => {
           source: m.source || null,
           context: m.context || 'generic',
           signalType: m.signal_type || null,
+          confidence: m.confidence || null,        // confirmed | likely | unverified (sold-out trust tier)
           eventName: m.event_name || null,
+          // Deep link to the listing on the buying platform (exact lot / event page).
+          ...(() => { const r = resolveListingUrl(m); return r ? { listingUrl: r.url, listingUrlKind: r.kind } : {} })(),
           read: alert.is_read || false,
         }
       })
