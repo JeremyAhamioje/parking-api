@@ -1386,11 +1386,15 @@ app.get('/api/signals', async (req, res) => {
 // it points at the SAME platform we'd buy from, so a SpotHero alert never links to
 // a Ticketmaster/ParkWhiz page. Returns { url, kind } or null.
 const PLATFORM_DOMAIN = { spothero: 'spothero.com', parkwhiz: 'parkwhiz.com', way: 'way.com' }
+// SpotHero's only valid deep link is the event MAP (search?kind=event&id=…). Older
+// scrapes stored /events/{seo_url} URLs that redirect to a marketing page, so guard
+// against surfacing those: a SpotHero event_url must be the map form to count.
+const isUsableEventUrl = (src, ev) => src === 'spothero' ? ev.includes('kind=event') : true
 function resolveListingUrl(m) {
   if (m.listing_url) return { url: m.listing_url, kind: m.source === 'way' ? 'exact' : 'event' }
   const ev = m.event_url
   const dom = PLATFORM_DOMAIN[m.source]
-  if (ev && dom && ev.includes(dom)) return { url: ev, kind: 'event' }
+  if (ev && dom && ev.includes(dom) && isUsableEventUrl(m.source, ev)) return { url: ev, kind: 'event' }
   return null
 }
 
